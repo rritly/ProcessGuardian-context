@@ -190,3 +190,153 @@ Post-commit targeted run of the new fixture: 8/8, 38 ms.
 `SPEC.md`, `AGENTS.md`, `opencode.json`, `.gitignore`, `AI_WORKLOG.md` — not
 modified or committed. No push, no history rewriting. The user's existing
 `ProcessGuardianAdmin` scheduled task was never touched from this work.
+
+---
+
+## Work 3 — R-AS-POWER-POLICY: remove battery power restrictions from autostart
+
+**Date:** 2026-11-05 · **Base:** `d036bc4` (main) · **Commit:** `cefffc0` · **Status:** completed
+
+### Goal
+
+Fix the confirmed power-policy defect in `ScheduledTaskAutostartService`: the
+`ProcessGuardianAdmin` autostart task must start at user logon regardless of the
+power source and must not be stopped when the machine switches to battery power.
+
+### Root cause (live-evidence confirmed)
+
+A real `/Query /XML` export of the user's `ProcessGuardianAdmin` task showed:
+
+```xml
+<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+```
+
+Per Microsoft documentation (TaskSettings.DisallowStartIfOnBatteries property,
+MSDN/Win32), the schema default for both flags is `true` — meaning the task
+**will not start** if running on battery and **will stop** if the charger is
+disconnected. `schtasks.exe /Create` (the previous registration path) has no
+command-line switches for these Task Settings; the `/TR` command-line variant
+therefore left both at their default `true` values. `ParseTaskXml()` did not
+read or verify these flags, so the task was classified as `Enabled` despite
+the power restrictions.
+
+### Fix (`ScheduledTaskAutostartService.cs`)
+
+**Registration (new `CreateTaskAsync` / `BuildTaskDefinitionXml`):**
+
+`schtasks.exe /Create` has no `/SC`/`/RL`-equivalent switches for the battery
+power settings. The only schtasks facility that can set them is `/Create /XML`
+import. A full Task Scheduler 2.0 definition XML is built programmatically
+(`BuildTaskDefinitionXml`):
+
+- `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>`
+- `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>`
+- LogonTrigger, InteractiveToken, HighestAvailable, quoted executable with
+  `--background`, per-call unique temp path, `Encoding.Unicode` (utf-16)
+  matching the XML declaration — XElement construction provides automatic
+  escaping of special characters in the executable path.
+- Principal `UserId` = `{Environment.UserDomainName}\{Environment.UserName}`
+  resolved at runtime — nothing machine-specific is hard-coded.
+
+The temp file is always deleted in a `finally` block (success, failure,
+cancellation). `BuildCreateArguments` now accepts the definition file path
+(and exports `/XML "<path>" /F`).
+
+**Parsing (`ParseTaskXml`):**
+
+`TaskDescriptor` gained `DisallowStartIfOnBatteries` and
+`StopIfGoingOnBatteries` fields. Both are parsed from `<Settings>`:
+
+- Present + parsable boolean → the value
+- Present + unparsable → `null` (fail-closed), bounded `LogWarning` with only
+  the raw element value
+- Absent → `null` (no schema default applied — Windows defaults both to `true`,
+  so absence is never proof of compliance; `GetMismatches` catches this)
+
+**Verification (`GetMismatches`):**
+
+Both flags must be explicitly `false`. Any other value (including `null`)
+produces a `TaskMismatch` with `Expected="false"` and `Actual=<value or "<missing>">`.
+The existing invariants (Command, --background, LogonTrigger, InteractiveToken,
+HighestAvailable) are unchanged.
+
+**Existing repair path reused:** `SetEnabledAsync(true)` already skips the
+"already Enabled" fast-path for `Misconfigured` tasks, so the repair path
+(`/Create /F`) runs automatically for an already-enabled task whose battery
+policy is wrong. The post-registration `/Query /XML` verification confirms the
+actual flags, never trusts the `/Create` exit code alone.
+
+### Tests
+
+New `tests/ProcessGuardian.Infrastructure.Tests/ScheduledTaskAutostartPowerPolicyTests.cs`
+(24 tests), all through the `SchTasksInvoker` seam:
+
+- **XML parsing** (7): both flags explicit false → both false; each flag
+  individually true → parsed as true; each flag individually absent → null
+  (no schema default); unparsable values → null, bounded warnings contain only
+  the raw invalid value; unparsable XML → null (existing fail-closed semantics
+  preserved).
+- **State evaluation** (5): compliant Enabled → Enabled; Enabled + each battery
+  restriction individually → Misconfigured; both restrictions + correct
+  parameters → Misconfigured (battery mismatch not masked by other correct
+  values).
+- **Mismatch diagnostics** (3): `true` actuals, missing actuals (`"<missing>"`),
+  unparsable actuals.
+- **Definition XML** (6): both flags `false` in built XML; round-trip through
+  production parser → 0 mismatches, Enabled state; XML special characters in
+  exe path are escaped (`&` → `&amp;`); exactly one XML declaration matching
+  utf-16 encoding; `UserId` is runtime identity.
+- **Registration / repair / verification** (3): already-Enabled battery-restricted
+  task → re-registered via `/Create /XML` + `/F`, Verified Enabled; create exits 0
+  but verification still shows battery restriction → fails as Misconfigured;
+  create nonzero → failure handled by existing error mechanism.
+
+Updated `ScheduledTaskAutostartXmlVerifyTests.cs`: 3 tests that previously
+asserted "all checks pass" / "Enabled" for the verbatim real export (which has
+both battery flags true) now assert `Misconfigured` + exact failing check names;
+`Evaluate_RealWindowsExport_WithoutSettingsElement` changed from `Unknown` to
+`Misconfigured` (absent battery flags are a mismatch per 4.3 requirement).
+
+Updated `ScheduledTaskAutostartServiceTests.cs` and
+`ScheduledTaskAutostartServiceErrorTests.cs`: `TaskXml` helper extended with
+`disallow`/`stop` parameters (default to `"false"` = compliant); the missing-
+`<Settings>` test in both files now asserts `Misconfigured` (battery flags are
+unverifiable = mismatch); `ParseTaskXml_ParsesExpectedConfiguration_ToEnabledDescriptor`
+asserts both battery fields false.
+
+### Verification matrix (4 gate commands)
+
+| Command | Result | Exit |
+|---------|--------|------|
+| `dotnet build .\ProcessGuardian.sln -c Release` | 0 warnings / 0 errors | 0 |
+| `dotnet build .\ProcessGuardian.sln -c Release-Elevated` | 0 warnings / 0 errors | 0 |
+| `dotnet test .\ProcessGuardian.sln -c Release` | 213/213 Infra + 41/41 Wpf + 82/82 App = 336/336 | 0 |
+| `dotnet test .\ProcessGuardian.sln -c Release-Elevated` | 336/336 | 0 |
+
+### Open items (manual verification)
+
+- Toggle "Autostart with Windows" off/on in the admin app on real Windows (the
+  old battery-restricted task should be automatically replaced by the new
+  compliant one; the checkbox must enable without error).
+- `schtasks.exe /Query /TN "ProcessGuardianAdmin" /XML` after enabling: both
+  `<DisallowStartIfOnBatteries>` and `<StopIfGoingOnBatteries>` must be `false`.
+- On a real laptop: unplug charger → log off → log on → ProcessGuardianAdmin
+  must start automatically.
+- On a real laptop: with ProcessGuardianAdmin running, unplug the charger →
+  the app must NOT be stopped.
+- DPI toast check (100/125/150/200 %) — still open from Work 1; Stage 1 remains
+  conditionally accepted until performed.
+
+### Side note (no fix applied, documented only)
+
+`SPEC.md` AS-06 describes the registration as `schtasks.exe /Create ... /SC
+ONLOGON /RL HIGHEST /F` (the old `/TR` command-line form). The text is now
+factually incorrect. `SPEC.md` is protected and was not edited.
+
+### Protected files / git hygiene
+
+`SPEC.md`, `AGENTS.md`, `opencode.json`, `.gitignore`, `AI_WORKLOG.md` — not
+modified or committed. No push, no history rewriting. The user's existing
+`ProcessGuardianAdmin` scheduled task was not modified directly; enabling the
+checkbox will replace it via `/Create /F`.
