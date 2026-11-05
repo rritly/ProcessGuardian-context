@@ -105,3 +105,88 @@ R-KE / R-CD / R-F → `GuardianOrchestratorTests` 54/54 + `WindowsProcessMonitor
 `SPEC.md`, `AGENTS.md`, `opencode.json`, `.gitignore` — never modified or committed
 during these works. No push, no history rewriting. Final tree clean except
 intentionally untracked files.
+
+---
+
+## Work 2 — R-AS-XML-VERIFY: honor Task Scheduler default enabled state
+
+**Date:** 2026-11-05 · **Base:** `0b3997c` (main) · **Commit:** `d036bc4` · **Status:** completed
+
+### Goal
+
+Fix the confirmed defect in `ScheduledTaskAutostartService` where the admin edition
+could not verify a successfully created autostart task: `SetEnabledAsync(true)`
+reported "the resulting autostart state could not be verified" after `/Create`
+exited 0.
+
+### Root cause (live-evidence confirmed)
+
+A real `/Query /XML` export of the successfully created `ProcessGuardianAdmin`
+task (captured by the user on live Windows, 2026-11-05) contains NO `<Enabled>`
+element inside `<Settings>`. Per the Windows Task Scheduler schema,
+`<Settings/Enabled>` is OPTIONAL and defaults to `true` when the `<Settings>`
+element itself is present. The parser left `TaskDescriptor.Enabled = null`,
+`Evaluate()` classified that as `Unknown`, and the post-create verification
+failed even though the task existed and the query exited 0.
+
+### Fix (`src/ProcessGuardian.Infrastructure/Autostart/ScheduledTaskAutostartService.cs`)
+
+`ParseTaskXml()` now applies the schema default:
+
+- `<Settings>` present without an `<Enabled>` child → `Enabled = true`;
+- explicit `true` / `false` → parsed as before;
+- `<Enabled>` with an unparsable boolean → fail-closed `Unknown` preserved, plus
+  a new bounded `LogWarning` that records only the raw invalid element value
+  (never the whole exported task XML); `ParseTaskXml` gained an optional
+  `ILogger?` parameter, wired from `ReadStateDetailedAsync`;
+- NO `<Settings>` element at all → the schema-default rule is NOT extended to
+  this case; the state stays `Unknown`.
+
+Unchanged: exact-Command / `--background` / LogonTrigger / InteractiveToken /
+HighestAvailable checks; the post-operation `/Query /XML` (not the `/Create`
+exit code) remains the only source of a verified state.
+
+### Tests
+
+New `tests/ProcessGuardian.Infrastructure.Tests/ScheduledTaskAutostartXmlVerifyTests.cs`
+(8 tests) built around the verbatim real Windows export:
+
+- real export without `<Enabled>`: descriptor `Enabled=true`, all mismatch
+  checks pass (quoted `<Command>` included), `Evaluate` → `Enabled`;
+- explicit `true` → `Enabled`; explicit `false` → `Disabled`;
+- unparsable `Enabled` value → `Unknown`, warning contains the invalid value
+  but never the task XML;
+- stripped `<Settings>` block → `Unknown` (never auto-Enabled);
+- seam integration test: `Absent → /Create (exit 0) → verification /Query /XML
+  without <Enabled> → SetEnabledAsync(true) reports Success(Enabled)`.
+
+Updated the three tests that pinned the defective `Unknown` behavior to the
+schema-default semantics (`Evaluate_MissingEnabledElement_WithinSettings_
+DefaultsToEnabled`, `Evaluate_RealSchedulerExport_MissingEnabledElement_
+DefaultsToEnabled`, `ReadState_MissingEnabledElement_DefaultsToEnabled`) and
+added no-`<Settings>` → `Unknown` coverage next to each. All tests run through
+the `SchTasksInvoker` seam; no real scheduled task is touched.
+
+### Verification matrix (4 gate commands)
+
+| Command | Result | Exit |
+|---------|--------|------|
+| `dotnet build .\ProcessGuardian.sln -c Release` | 0 warnings / 0 errors | 0 |
+| `dotnet build .\ProcessGuardian.sln -c Release-Elevated` | 0 warnings / 0 errors | 0 |
+| `dotnet test .\ProcessGuardian.sln -c Release` | 188/188 Infra + 41/41 Wpf + 82/82 App = 311/311 | 0 |
+| `dotnet test .\ProcessGuardian.sln -c Release-Elevated` | 311/311 | 0 |
+
+Post-commit targeted run of the new fixture: 8/8, 38 ms.
+
+### Open items (manual verification)
+
+- Toggle "Autostart with Windows" off/on in the admin app on real Windows: the
+  checkbox must enable without the "state could not be verified" report.
+- DPI toast check (100/125/150/200 %) — still open from Work 1; Stage 1 remains
+  conditionally accepted until performed.
+
+### Protected files / git hygiene
+
+`SPEC.md`, `AGENTS.md`, `opencode.json`, `.gitignore`, `AI_WORKLOG.md` — not
+modified or committed. No push, no history rewriting. The user's existing
+`ProcessGuardianAdmin` scheduled task was never touched from this work.
