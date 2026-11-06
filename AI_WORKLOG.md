@@ -340,3 +340,96 @@ factually incorrect. `SPEC.md` is protected and was not edited.
 modified or committed. No push, no history rewriting. The user's existing
 `ProcessGuardianAdmin` scheduled task was not modified directly; enabling the
 checkbox will replace it via `/Create /F`.
+
+---
+
+## Work 4 — R-AS-RESTART-BUDGET: count all automatic restarts per session
+
+**Date:** 2026-11-05/06 · **Base:** `cefffc0` (main) · **Commit:** `db1fc5b` · **Status:** completed (pending manual acceptance)
+
+### Goal
+
+Change `MaxRestartAttempts` from a consecutive-failed-launch counter into a
+cumulative per-session budget of genuine automatic target-process launch
+attempts, per the user-authorized `plan\REMEDIATION_PLAN_v2.7_AMENDMENT.md`
+(§2 budget semantics, §4 implementation increment, §5 regression matrix).
+
+### Old vs new semantics
+
+- **Old (v2.5 E):** `RestartAttempts` incremented only for `NotStarted`/`VerifyFailed`
+  and reset to `0` on every `ProcessOutcome.Running` observation; a successful
+  automatic relaunch never consumed the budget.
+- **New (v2.7):** the counter is cumulative and monotonic per session; observing
+  `Running` never refunds a spent unit; every genuine automatic process-creation
+  attempt consumes exactly one unit regardless of outcome; only a newly created
+  session starts at zero.
+
+### Launch-charge classification (boundary inspected, not inferred)
+
+Inspected `WindowsProcessMonitor.TryStart`, `ProcessStartResult`, `StartAndVerifyAsync`,
+`HandleMissingAsync`, `SessionCounters`:
+
+- `ProcessStartStatus.Started` (verify `Verified` or `VerifyFailed`) → **charges 1**.
+- `ProcessStartStatus.Failed` — genuine creation failure: null from `Process.Start`,
+  Win32 codes other than 2/3/5/32, and any unexpected exception inside the adapter's
+  launch boundary (the concrete adapter converts all of them to typed results) → **charges 1**.
+- `Missing`/`ReadError` (blocked before the OS creation boundary), hash `Mismatch`,
+  `Cancelled`, session `Unknown`, and gate-blocked launches → **uncharged** (typed
+  semantics preserved).
+- Adapter exception escaping to the orchestrator is **indeterminate** → new typed
+  `StartOutcome.LaunchError`, uncharged (fail-safe: never spends the budget on an
+  unobserved attempt), session survives with the restart delay. Domain/Infrastructure
+  contracts unchanged.
+
+Charged exactly once in `HandleMissingAsync`, after the typed outcome, never before
+the hash/gate checks. `SessionEnd.BudgetExhausted` reuses the existing R-F settlement
+(persist enabled=false best-effort → publish Error with independent SaveFailed); the
+fatal reason text was updated to cumulative wording ("the per-session automatic
+restart budget is exhausted...") — no test pinned the old text.
+
+### Tests
+
+Rewritten (superseded consecutive semantics): `SuccessfulRelaunch_DoesNotAdvance
+ConsecutiveBudget_NoPrematureError` → `SuccessfulRestart_ConsumesBudget_Running
+DoesNotRefund_SecondExitExhausts` (Max=1: free initial launch, one successful
+budgeted restart, several Running observations refund nothing, second exit → Error,
+exactly 2 TryStart).
+
+Added: `InitialRunningTarget_DoesNotConsumeBudget_FirstExitAllowsOneRestart` (§5.6),
+`Max2_AllowsExactlyTwoAutomaticAttempts_ThenExhausts` (§5.5, asserts 3 TryStart +
+R-F SaveAsync), `Max0_BudgetNeverExhausts` (§5.7), `LaunchError_AdapterThrows_
+Uncharged_SessionSurvives`. Preserved unchanged (still valid): free-initial-launch,
+Missing/ReadError/Unknown/Cancelled/Mismatch boundaries, fresh budget per new session
+(`NewStartAfterError...`), `Exhaustion_SaveThrows...` (comment updated). Exact
+`TryStart` counts and persistence asserted via `Received(n)`; deterministic
+`WaitUntilAsync` polling, no wall-clock sleeps for counter semantics.
+
+### Verification matrix (4 gate commands)
+
+| Command | Result | Exit |
+|---------|--------|------|
+| `dotnet build .\ProcessGuardian.sln -c Release` | 0 warnings / 0 errors | 0 |
+| `dotnet build .\ProcessGuardian.sln -c Release-Elevated` | 0 warnings / 0 errors | 0 |
+| `dotnet test .\ProcessGuardian.sln -c Release` | 213/213 Infra + 41/41 Wpf + 86/86 App = 340/340 | 0 |
+| `dotnet test .\ProcessGuardian.sln -c Release-Elevated` | 340/340 | 0 |
+
+### Housekeeping (same period, user command)
+
+Local `plan\` directory created at the repo root and `REMEDIATION_PLAN.md` +
+`REMEDIATION_PLAN_v2.6_AMENDMENT.md` + the v2.7 amendment moved there from
+`~\.opencode\plan`; `AGENTS.md` §3 now documents `\plan` as a protected,
+never-committed planning artifact. Untracked, uncommitted (protected).
+
+### Open items (manual verification)
+
+- §8 manual acceptance scenario (real Windows, harmless target exe): Max=1 → close
+  target twice; second close must terminate with ERROR and persisted enabled=false;
+  new session must have a fresh budget; Max=0 must not terminate by this budget.
+- Prior open items unchanged: autostart toggle + battery flags check, charger
+  unplug scenarios (Work 3), DPI toast check at 100/125/150/200 % (Work 1).
+
+### Protected files / git hygiene
+
+`SPEC.md`, `AGENTS.md`, `opencode.json`, `.gitignore`, and the plan files were not
+modified or committed; no push, no history rewriting. Commit `db1fc5b` contains only
+`GuardianOrchestrator.cs` + `GuardianOrchestratorTests.cs` (+207/−27).
